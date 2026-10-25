@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: accepted (provisional)
 ---
 
 # Texturizado por proyección multivista sobre ComfyUI: seguimos, con condiciones
@@ -45,7 +45,7 @@ El pico es de **15,1 GB de los 16 GB** de la tarjeta, con una base de ~1,0–1,3
 - **Una sola malla, una sola referencia, una sola semilla final.** El busto de 122 tris tiene poca oclusión. Un humanoide de ~1000 tris en A-pose tiene axilas, entrepierna, cara interior de los brazos y espacio entre las piernas, que 5 vistas no van a cubrir igual de bien.
 - **La resolución final fue de 128 px.** #11 pide 256 px, que muestra el doble de detalle, y también el doble de costuras y de sombreado horneado.
 - **La duplicación de emblemas está confirmada**, no es un caso aislado. En un cuerpo con piel y ropa interior lisas no debería notarse. En prendas con un motivo único (un logo, un escudo) sí aparecerá.
-- La validación visual es mía, hecha sobre los previews renderizados. Falta que el usuario abra el `.blend`.
+- La validación visual es mía, hecha sobre los previews renderizados. El usuario abrió el `.blend` el 2026-10-25 y aceptó el veredicto como **provisional**: la malla de prueba es demasiado abstracta para juzgar la calidad de un personaje, así que solo valida la mecánica (proyección, cobertura, costuras, contrato PSX y reproducibilidad). La calidad se valida de verdad en #11, sobre el cuerpo base real (condición 5).
 
 ## Condiciones para #11 (texturizador de cuerpo)
 
