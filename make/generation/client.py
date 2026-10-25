@@ -1,0 +1,191 @@
+"""Image generation client: conditions -> image.
+
+`GenerationClient` is the one interface the texturer depends on. Two
+implementations: `ComfyUIClient` (real, ComfyUI HTTP API) and
+`FakeGenerationClient` (fixed images, no GPU) for tests.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import io
+import json
+import time
+import uuid
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Protocol
+from urllib.parse import urlencode
+
+from PIL import Image
+
+from make import settings
+from make.comfyui import http
+from make.generation.workflow import Workflow
+
+
+@dataclass(frozen=True)
+class Conditions:
+    """Everything a generation is conditioned on.
+
+    depth/normal: renders of our mesh from the projection camera; the output
+        has their size (must be a multiple of 8, ~1024 px is SDXL's sweet spot).
+    references: reference images for IP-Adapter, one per workflow slot.
+    mask: optional; white = object. The output gets it as alpha channel.
+    init/repaint: optional, together. Continue a view that earlier views already
+        painted in part: `init` is that paint seen from this camera, `repaint` (L,
+        white = generate, black = keep, grey = change partly) says what to redo.
+        The client then uses its repaint workflow.
+    """
+
+    depth: Image.Image
+    normal: Image.Image
+    prompt: str
+    seed: int
+    references: tuple[Image.Image, ...] = ()
+    mask: Image.Image | None = None
+    init: Image.Image | None = None
+    repaint: Image.Image | None = None
+    negative_prompt: str = "blurry, lowres, text, watermark, signature, jpeg artifacts"
+
+    @classmethod
+    def from_files(cls, depth: Path, normal: Path, prompt: str, seed: int,
+                   references: tuple[Path, ...] = (), mask: Path | None = None) -> "Conditions":
+        return cls(
+            depth=Image.open(depth), normal=Image.open(normal), prompt=prompt, seed=seed,
+            references=tuple(Image.open(r) for r in references),
+            mask=Image.open(mask) if mask else None,
+        )
+
+
+class GenerationClient(Protocol):
+    def generate(self, conditions: Conditions) -> Image.Image: ...
+
+
+class GenerationError(Exception):
+    pass
+
+
+def _apply_mask(image: Image.Image, mask: Image.Image | None) -> Image.Image:
+    if mask is None:
+        return image
+    image = image.convert("RGBA")
+    image.putalpha(mask.convert("L").resize(image.size, Image.Resampling.NEAREST))
+    return image
+
+
+def _png(image: Image.Image) -> bytes:
+    buffer = io.BytesIO()
+    image.save(buffer, "PNG")
+    return buffer.getvalue()
+
+
+class FakeGenerationClient:
+    """Returns a fixed image (solid color, or a given one) at the render size."""
+
+    def __init__(self, image: Image.Image | None = None, color: tuple[int, int, int] = (128, 96, 64)):
+        self.image = image
+        self.color = color
+        self.calls: list[Conditions] = []
+
+    def generate(self, conditions: Conditions) -> Image.Image:
+        self.calls.append(conditions)
+        size = conditions.depth.size
+        image = self.image.convert("RGB").resize(size) if self.image else Image.new("RGB", size, self.color)
+        return _apply_mask(image, conditions.mask)
+
+
+class ComfyUIClient:
+    def __init__(self, url: str | None = None, workflow: Workflow | None = None,
+                 work_dir: Path | None = None, timeout: float = 600, poll_interval: float = 0.25,
+                 repaint_workflow: Workflow | None = None):
+        self.url = url or settings.comfyui_url()
+        self.workflow = workflow or Workflow.load_default()
+        self.repaint_workflow = repaint_workflow or Workflow.load_repaint()
+        self.work_dir = Path(work_dir or settings.work_dir()) / "generations"
+        self.timeout = timeout
+        self.poll_interval = poll_interval
+
+    def generate(self, conditions: Conditions) -> Image.Image:
+        width, height = conditions.depth.size
+        if width % 8 or height % 8:
+            raise ValueError(f"render size {width}x{height} must be a multiple of 8")
+        if conditions.normal.size != conditions.depth.size:
+            raise ValueError("depth and normal renders must have the same size")
+        if (conditions.init is None) != (conditions.repaint is None):
+            raise ValueError("init and repaint go together: give both to continue a view, or neither")
+        workflow = self.workflow if conditions.init is None else self.repaint_workflow
+        slots = workflow.reference_slots()
+        if len(conditions.references) != slots:
+            raise ValueError(
+                f"workflow {workflow.name!r} takes {slots} reference image(s), got {len(conditions.references)}"
+            )
+
+        values: dict[str, dict] = {
+            "input:prompt": {"text": conditions.prompt},
+            "input:negative": {"text": conditions.negative_prompt},
+            "input:depth": {"image": self._upload(conditions.depth.convert("RGB"))},
+            "input:normal": {"image": self._upload(conditions.normal.convert("RGB"))},
+            "input:seed": {"seed": conditions.seed},
+        }
+        if workflow.has("input:size"):
+            values["input:size"] = {"width": width, "height": height}
+        for index, reference in enumerate(conditions.references):
+            values[f"input:reference:{index}"] = {"image": self._upload(reference.convert("RGB"))}
+        if conditions.init is not None:
+            values["input:init"] = {"image": self._upload(conditions.init.convert("RGB").resize((width, height)))}
+            repaint = conditions.repaint.convert("L").resize((width, height)).convert("RGB")
+            values["input:repaint"] = {"image": self._upload(repaint)}
+        graph = workflow.bind(values)
+
+        image = self._run(workflow, graph)
+        image = _apply_mask(image, conditions.mask)
+        self._save(workflow, graph, image)
+        return image
+
+    def free(self, unload_models: bool = False) -> None:
+        """Drop ComfyUI's cached node outputs (and optionally unload models from VRAM).
+
+        ComfyUI reuses cached outputs for an identical graph, so without this a
+        repeated generation returns instantly without recomputing.
+        """
+        http.post_json(f"{self.url}/free", {"free_memory": True, "unload_models": unload_models})
+
+    def _upload(self, image: Image.Image) -> str:
+        data = _png(image)
+        name = f"acc_{hashlib.sha1(data).hexdigest()[:16]}.png"
+        response = http.post_file(f"{self.url}/upload/image", "image", name, data,
+                                  {"overwrite": "true", "type": "input"})
+        return response["name"]
+
+    def _run(self, workflow: Workflow, graph: dict) -> Image.Image:
+        try:
+            queued = http.post_json(f"{self.url}/prompt", {"prompt": graph, "client_id": uuid.uuid4().hex})
+        except http.HttpError as error:
+            raise GenerationError(f"ComfyUI rejected workflow {workflow.name!r}: {error.body}") from error
+        prompt_id = queued["prompt_id"]
+
+        deadline = time.monotonic() + self.timeout
+        while True:
+            history = http.get_json(f"{self.url}/history/{prompt_id}")
+            if prompt_id in history:
+                entry = history[prompt_id]
+                break
+            if time.monotonic() > deadline:
+                raise GenerationError(f"ComfyUI prompt {prompt_id} did not finish in {self.timeout}s")
+            time.sleep(self.poll_interval)
+
+        status = entry.get("status", {})
+        if status.get("status_str") == "error":
+            raise GenerationError(f"ComfyUI failed prompt {prompt_id}: {json.dumps(status.get('messages'))}")
+        images = entry["outputs"][workflow.node_id("output:image")]["images"]
+        ref = images[0]
+        query = urlencode({"filename": ref["filename"], "subfolder": ref["subfolder"], "type": ref["type"]})
+        data = http.get_bytes(f"{self.url}/view?{query}")
+        return Image.open(io.BytesIO(data)).convert("RGB")
+
+    def _save(self, workflow: Workflow, graph: dict, image: Image.Image) -> None:
+        self.work_dir.mkdir(parents=True, exist_ok=True)
+        stem = f"{time.strftime('%Y%m%d-%H%M%S')}_{workflow.name}_{uuid.uuid4().hex[:6]}"
+        image.save(self.work_dir / f"{stem}.png")
+        (self.work_dir / f"{stem}.json").write_text(json.dumps(graph, indent=1), encoding="utf-8")
