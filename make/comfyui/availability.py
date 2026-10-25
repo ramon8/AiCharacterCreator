@@ -13,13 +13,18 @@ class ComfyUIUnavailable(Exception):
     pass
 
 
+def probe(url: str, timeout: float = 5) -> None:
+    """Raise `http.ServerUnreachable` / `http.HttpError` unless a ComfyUI server answers at `url`."""
+    http.get_json(f"{url}/system_stats", timeout=timeout)
+
+
 def check(url: str | None = None, workflows: list[Workflow] | None = None) -> None:
     """Raise `ComfyUIUnavailable` unless the server can run `workflows` (default: all
     the workflows in the repo)."""
-    url = (url or settings.comfyui_url()).rstrip("/")
+    url = url or settings.comfyui_url()
     workflows = workflows or Workflow.load_all()
     try:
-        http.get_json(f"{url}/system_stats", timeout=5)
+        probe(url)
     except (http.ServerUnreachable, http.HttpError) as error:
         raise ComfyUIUnavailable(
             f"ComfyUI server not responding at {url} ({error}). Start it with `uv run make comfyui start`."

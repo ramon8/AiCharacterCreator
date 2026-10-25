@@ -15,6 +15,7 @@ import os
 import shutil
 import subprocess
 import sys
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -50,6 +51,12 @@ def _hf_token() -> str | None:
     return path.read_text().strip() if path.exists() else None
 
 
+def _complete_size(error: urllib.error.HTTPError) -> int | None:
+    """Total size from a 416 answer's `Content-Range: bytes */<size>`, if given."""
+    _, _, total = (error.headers.get("Content-Range") or "").partition("/")
+    return int(total) if total.isdigit() else None
+
+
 def download(url: str, dest: Path) -> None:
     if dest.exists():
         print(f"ok   {dest}")
@@ -63,7 +70,18 @@ def download(url: str, dest: Path) -> None:
     if token := _hf_token():
         request.add_header("Authorization", f"Bearer {token}")
     print(f"get  {url} -> {dest}", flush=True)
-    with urllib.request.urlopen(request) as response, open(part, "ab" if offset else "wb") as out:
+    try:
+        response = urllib.request.urlopen(request)
+    except urllib.error.HTTPError as error:
+        if not (offset and error.code == 416):
+            raise
+        # Range past the end: the .part is the whole file if its size is the file's size.
+        if _complete_size(error) == offset:
+            part.rename(dest)
+            return
+        part.unlink()  # longer than the file, or unverifiable: start over
+        return download(url, dest)
+    with response, open(part, "ab" if offset else "wb") as out:
         if offset and response.status != 206:  # server ignored Range: restart
             out.truncate(0)
         shutil.copyfileobj(response, out, length=16 * 1024 * 1024)

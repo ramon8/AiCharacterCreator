@@ -50,11 +50,11 @@ class Conditions:
 
     @classmethod
     def from_files(cls, depth: Path, normal: Path, prompt: str, seed: int,
-                   references: tuple[Path, ...] = (), mask: Path | None = None, **kwargs) -> "Conditions":
+                   references: tuple[Path, ...] = (), mask: Path | None = None) -> "Conditions":
         return cls(
             depth=Image.open(depth), normal=Image.open(normal), prompt=prompt, seed=seed,
             references=tuple(Image.open(r) for r in references),
-            mask=Image.open(mask) if mask else None, **kwargs,
+            mask=Image.open(mask) if mask else None,
         )
 
 
@@ -99,7 +99,7 @@ class ComfyUIClient:
     def __init__(self, url: str | None = None, workflow: Workflow | None = None,
                  work_dir: Path | None = None, timeout: float = 600, poll_interval: float = 0.25,
                  repaint_workflow: Workflow | None = None):
-        self.url = (url or settings.comfyui_url()).rstrip("/")
+        self.url = url or settings.comfyui_url()
         self.workflow = workflow or Workflow.load_default()
         self.repaint_workflow = repaint_workflow or Workflow.load_repaint()
         self.work_dir = Path(work_dir or settings.work_dir()) / "generations"

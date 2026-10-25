@@ -21,13 +21,12 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import numpy as np
 from PIL import Image
 
 from make import blender
 from make.generation import Conditions, GenerationClient
 from make.texturing.mesh import MeshData
-import numpy as np
-
 from make.texturing.projection import (
     BAKE_SIZE,
     ViewBake,
@@ -92,10 +91,14 @@ def render_view(mesh_blend: Path, mesh: MeshData, view: View, work_dir: Path,
                          (("depth", "RGB"), ("normal", "RGB"), ("mask", "L"))))
 
 
-def generate_view(client: GenerationClient, renders: ViewRenders, reference: Image.Image, prompt: str,
-                  seed: int, out: Path | None = None) -> Image.Image:
+def generate_view(client: GenerationClient, renders: ViewRenders, references: tuple[Image.Image, ...],
+                  prompt: str, seed: int, out: Path | None = None,
+                  init: Image.Image | None = None, repaint: Image.Image | None = None) -> Image.Image:
+    """Generate the view seen in `renders`. With `init` + `repaint` it continues the
+    paint earlier views left (see `Conditions`)."""
     image = client.generate(Conditions(depth=renders.depth, normal=renders.normal, mask=renders.mask,
-                                       references=(reference,), prompt=prompt, seed=seed))
+                                       references=references, prompt=prompt, seed=seed,
+                                       init=init, repaint=repaint))
     if out is not None:
         image.save(out)
     return image
@@ -109,12 +112,13 @@ def finish_texture(bakes: Mapping[str, ViewBake], sharpness: float = 1.0,
     return reduce_to_psx(to_texture(color, covered, surface=surface))
 
 
-def pack(mesh_blend: Path, texture: Path, out_blend: Path, previews: Mapping[str, View] = {}) -> list[Path]:
+def pack(mesh_blend: Path, texture: Path, out_blend: Path, previews: list[View] | None = None) -> list[Path]:
     """Save `mesh_blend` as `out_blend` with `texture` packed in; render the previews
-    (shadeless, nearest) next to the texture and return their paths."""
+    (shadeless, nearest) next to the texture as preview_<view name>.png and return
+    their paths."""
     out_blend.parent.mkdir(parents=True, exist_ok=True)
-    jobs = [{"view": _blender_view(v), "path": str(texture.parent / f"preview_{name}.png")}
-            for name, v in previews.items()]
+    jobs = [{"view": _blender_view(v), "path": str(texture.parent / f"preview_{v.name}.png")}
+            for v in previews or []]
     result = blender.run("pack_texture", {"texture": str(texture), "out": str(out_blend), "previews": jobs},
                          blend=mesh_blend)
     return [Path(p) for p in result["previews"]]
@@ -127,41 +131,57 @@ def _sheet(images: list[Image.Image], size: int) -> Image.Image:
     return sheet
 
 
+def _start(mesh_blend: Path, reference: Path | Image.Image, work_dir: Path,
+           timings: dict[str, float]) -> tuple[Path, Image.Image, MeshData]:
+    """Create the work dir, load the reference and export the mesh."""
+    work_dir = Path(work_dir)
+    work_dir.mkdir(parents=True, exist_ok=True)
+    reference = reference if isinstance(reference, Image.Image) else Image.open(reference)
+    with _timed(timings, "export_mesh"):
+        mesh = export_mesh(mesh_blend, work_dir)
+    return work_dir, reference, mesh
+
+
+def _bake_and_pack(bakes: Mapping[str, ViewBake], mesh_blend: Path, out_blend: Path, previews: list[View],
+                   work_dir: Path, timings: dict[str, float], **finish) -> tuple[Image.Image, Path, list[Path]]:
+    """Finish the texture (`finish`: `finish_texture` options), save it as
+    texture_psx.png and pack it into `out_blend` with its previews."""
+    with _timed(timings, "psx_reduce"):
+        texture = finish_texture(bakes, **finish)
+        texture_path = work_dir / "texture_psx.png"
+        texture.save(texture_path)
+    with _timed(timings, "pack_and_preview"):
+        preview_paths = pack(Path(mesh_blend), texture_path, Path(out_blend), previews)
+    return texture, texture_path, preview_paths
+
+
+def _result(work_dir: Path, timings: dict[str, float], **result) -> TexturingResult:
+    """Write timings.json and return the result."""
+    (work_dir / "timings.json").write_text(json.dumps(timings, indent=1), encoding="utf-8")
+    return TexturingResult(timings=timings, **result)
+
+
 def texture_single_view(mesh_blend: Path, reference: Path | Image.Image, prompt: str, seed: int,
                         out_blend: Path, client: GenerationClient, work_dir: Path,
                         resolution: int = 1024, bake_size: int = BAKE_SIZE) -> TexturingResult:
     """Texture `mesh_blend` from a front camera and save it as `out_blend`."""
-    work_dir = Path(work_dir)
-    work_dir.mkdir(parents=True, exist_ok=True)
-    reference = reference if isinstance(reference, Image.Image) else Image.open(reference)
     timings: dict[str, float] = {}
-
-    with _timed(timings, "export_mesh"):
-        mesh = export_mesh(mesh_blend, work_dir)
+    work_dir, reference, mesh = _start(mesh_blend, reference, work_dir, timings)
     front = View.framing(mesh, name="front", resolution=resolution)
     with _timed(timings, "render_view"):
         renders = render_view(mesh_blend, mesh, front, work_dir)
     with _timed(timings, "generate"):
-        generated = generate_view(client, renders, reference, prompt, seed,
+        generated = generate_view(client, renders, (reference,), prompt, seed,
                                   out=work_dir / "views" / front.name / "generated.png")
     with _timed(timings, "project_bake"):
         bakes = {front.name: project_view(mesh, front, generated, bake_size=bake_size)}
-    with _timed(timings, "psx_reduce"):
-        texture = finish_texture(bakes)
-        texture_path = work_dir / "texture_psx.png"
-        texture.save(texture_path)
-    previews = {
-        "front": View.framing(mesh, name="front", resolution=PREVIEW_SIZE),
-        "three_quarter": View.framing(mesh, name="three_quarter", azimuth=35, elevation=10, resolution=PREVIEW_SIZE),
-    }
-    with _timed(timings, "pack_and_preview"):
-        preview_paths = pack(Path(mesh_blend), texture_path, Path(out_blend), previews)
+    previews = View.around(mesh, (("front", 0, 0), ("three_quarter", 35, 10)), resolution=PREVIEW_SIZE)
+    texture, texture_path, preview_paths = _bake_and_pack(bakes, mesh_blend, out_blend, previews,
+                                                          work_dir, timings)
 
     preview = work_dir / "preview.png"
     _sheet([generated, *(Image.open(p) for p in preview_paths), texture], PREVIEW_SIZE).save(preview)
-    (work_dir / "timings.json").write_text(json.dumps(timings, indent=1), encoding="utf-8")
-    return TexturingResult(blend=Path(out_blend), texture=texture_path, preview=preview, bakes=bakes,
-                           timings=timings)
+    return _result(work_dir, timings, blend=Path(out_blend), texture=texture_path, preview=preview, bakes=bakes)
 
 
 # Multiview (#19) ------------------------------------------------------------
@@ -170,32 +190,25 @@ SHARPNESS = 4.0  # merge weight = facing**SHARPNESS: the camera that faces a tex
 KEEP_FROM, KEEP_FULLY = 0.3, 0.6  # earlier-view confidence where repainting starts to fade / stops
 NEUTRAL = (128, 128, 128)
 SMOOTH_ANGLE = 45.0  # conditioning normals are smoothed across edges flatter than this (degrees)
-# View-dependent prompting: tell the model which side it is painting, so the back
-# does not get a second face or chest emblem.
-VIEW_PROMPTS = {"front": "front view", "right": "side view from the right", "left": "side view from the left",
-                "back": "back view, seen from behind", "top": "top view, seen from above"}
 
 
 def view_prompt(prompt: str, view: View) -> str:
-    phrase = VIEW_PROMPTS.get(view.name)
-    return f"{prompt}, {phrase}" if phrase else prompt
+    """`prompt` plus the side of the character `view` shows (view-dependent prompting)."""
+    return f"{prompt}, {view.side}" if view.side else prompt
 
 
 def default_views(mesh: MeshData, resolution: int = 1024) -> list[View]:
     """Projection cameras, in generation order: the front first (it sets the look),
     then the sides that overlap it, the back, and the top of the head."""
-    return [View.framing(mesh, name=name, azimuth=az, elevation=el, resolution=resolution)
-            for name, az, el in (("front", 0, 0), ("right", 90, 0), ("left", -90, 0),
-                                 ("back", 180, 0), ("top", 0, 89))]
+    return View.around(mesh, (("front", 0, 0), ("right", 90, 0), ("left", -90, 0),
+                              ("back", 180, 0), ("top", 0, 89)), resolution=resolution)
 
 
-def multiview_previews(mesh: MeshData, size: int = PREVIEW_SIZE) -> dict[str, View]:
+def multiview_previews(mesh: MeshData, size: int = PREVIEW_SIZE) -> list[View]:
     """Preview angles: the cameras and the angles halfway between them."""
-    angles = {"front": (0, 0), "front_right": (45, 0), "right": (90, 0), "back_right": (135, 0),
-              "back": (180, 0), "back_left": (-135, 0), "left": (-90, 0), "front_left": (-45, 0),
-              "above_front": (20, 45), "above_back": (200, 45)}
-    return {name: View.framing(mesh, name=name, azimuth=az, elevation=el, resolution=size)
-            for name, (az, el) in angles.items()}
+    return View.around(mesh, (("front", 0, 0), ("front_right", 45, 0), ("right", 90, 0), ("back_right", 135, 0),
+                              ("back", 180, 0), ("back_left", -135, 0), ("left", -90, 0), ("front_left", -45, 0),
+                              ("above_front", 20, 45), ("above_back", 200, 45)), resolution=size)
 
 
 def _smoothstep(lo: float, hi: float, x: np.ndarray) -> np.ndarray:
@@ -229,47 +242,40 @@ def texture_multiview(mesh_blend: Path, reference: Path | Image.Image, prompt: s
                       views: list[View] | None = None) -> TexturingResult:
     """Texture `mesh_blend` from several cameras and save it as `out_blend`.
 
-    Coherence: the first view is generated from the reference alone; every later
-    view gets the first generated view as a second reference (both through
-    IP-Adapter "style transfer", so they pass on palette and style but not the
-    composition: with "linear" every view repeated the front's chest emblem) and
-    continues the paint already projected (repaint workflow with differential
+    Coherence: the first view is generated from the reference alone (base workflow,
+    IP-Adapter "linear": the reference also gives the front its composition); every
+    later view gets the first generated view as a second reference (repaint workflow,
+    both references through IP-Adapter "style transfer", so they pass on palette and
+    style but not composition: with "linear" every view repeated the front's chest
+    emblem in its own centre) and continues the paint already projected (repaint workflow with differential
     diffusion: keep what earlier views saw well, generate the rest, soft in between).
     Each view's prompt names the side it shows. Seams: views blend by
     facing**SHARPNESS with normals smoothed across edges flatter than SMOOTH_ANGLE,
     so the hand-over is gradual inside faces; then the 128 px box reduction smooths
     what is left. Surface no camera saw is filled from the painted surface around it."""
-    work_dir = Path(work_dir)
-    work_dir.mkdir(parents=True, exist_ok=True)
-    reference = reference if isinstance(reference, Image.Image) else Image.open(reference)
     timings: dict[str, float] = {}
     started = time.perf_counter()
-
-    with _timed(timings, "export_mesh"):
-        mesh = export_mesh(mesh_blend, work_dir)
+    work_dir, reference, mesh = _start(mesh_blend, reference, work_dir, timings)
     views = views or default_views(mesh, resolution)
     bakes: dict[str, ViewBake] = {}
     generated: dict[str, Image.Image] = {}
-    first_view: Image.Image | None = None
+    first_image: Image.Image | None = None  # first generated view on neutral: 2nd reference of the rest
     for view in views:
         view_dir = work_dir / "views" / view.name
         with _timed(timings, f"render_view:{view.name}"):
             renders = render_view(mesh_blend, mesh, view, work_dir, smooth_angle=SMOOTH_ANGLE)
-        conditions = dict(depth=renders.depth, normal=renders.normal, mask=renders.mask,
-                          prompt=view_prompt(prompt, view), seed=seed)
-        if first_view is None:
-            conditions["references"] = (reference,)
-        else:
+        references, init, repaint = (reference,), None, None
+        if first_image is not None:
             init, repaint = continuation(mesh, view, bakes)
             init.save(view_dir / "init.png")
             repaint.save(view_dir / "repaint.png")
-            conditions.update(references=(reference, first_view), init=init, repaint=repaint)
+            references = (reference, first_image)
         with _timed(timings, f"generate:{view.name}"):
-            image = client.generate(Conditions(**conditions))
-        image.save(view_dir / "generated.png")
+            image = generate_view(client, renders, references, view_prompt(prompt, view), seed,
+                                  out=view_dir / "generated.png", init=init, repaint=repaint)
         generated[view.name] = image
-        if first_view is None:
-            first_view = _on_neutral(image, renders.mask)
+        if first_image is None:
+            first_image = _on_neutral(image, renders.mask)
         with _timed(timings, f"project_bake:{view.name}"):
             bakes[view.name] = project_view(mesh, view, image, bake_size=bake_size, smooth_angle=SMOOTH_ANGLE)
 
@@ -278,17 +284,12 @@ def texture_multiview(mesh_blend: Path, reference: Path | Image.Image, prompt: s
     coverage = {"surface_texels": int(surface.sum()), "seen_by_a_camera": int((surface & seen).sum()),
                 "filled_from_neighbours": int((surface & ~seen).sum())}
     (work_dir / "coverage.json").write_text(json.dumps(coverage, indent=1), encoding="utf-8")
-    with _timed(timings, "psx_reduce"):
-        texture = finish_texture(bakes, sharpness=SHARPNESS, surface=surface)
-        texture_path = work_dir / "texture_psx.png"
-        texture.save(texture_path)
-    with _timed(timings, "pack_and_preview"):
-        preview_paths = pack(Path(mesh_blend), texture_path, Path(out_blend), multiview_previews(mesh))
+    texture, texture_path, preview_paths = _bake_and_pack(bakes, mesh_blend, out_blend, multiview_previews(mesh),
+                                                          work_dir, timings, sharpness=SHARPNESS, surface=surface)
 
     preview = work_dir / "preview.png"
     _sheet([*generated.values(), texture], PREVIEW_SIZE // 2).save(work_dir / "generated.png")
     _sheet([Image.open(p) for p in preview_paths], PREVIEW_SIZE // 2).save(preview)
     timings["total"] = round(time.perf_counter() - started, 2)
-    (work_dir / "timings.json").write_text(json.dumps(timings, indent=1), encoding="utf-8")
-    return TexturingResult(blend=Path(out_blend), texture=texture_path, preview=preview, bakes=bakes,
-                           views=views, timings=timings)
+    return _result(work_dir, timings, blend=Path(out_blend), texture=texture_path, preview=preview, bakes=bakes,
+                   views=views)

@@ -57,7 +57,7 @@ def _texture(args: argparse.Namespace) -> int:
     out = args.out or work / f"{stem}_textured.blend"
     texture = texture_multiview if args.multiview else texture_single_view
     result = texture(mesh_blend=mesh, reference=args.reference, prompt=args.prompt,
-                                 seed=args.seed, out_blend=out, client=ComfyUIClient(), work_dir=work)
+                     seed=args.seed, out_blend=out, client=ComfyUIClient(), work_dir=work)
     for step, seconds in result.timings.items():
         print(f"  {step:<18} {seconds:6.2f}s")
     print(f"blend:   {result.blend}\npreview: {result.preview}")

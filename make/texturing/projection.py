@@ -33,6 +33,23 @@ class ViewBake:
     weight: np.ndarray  # (H, W) float, 0 = not painted by this view
 
 
+def _uv_to_pixels(uvs: np.ndarray, width: int, height: int) -> np.ndarray:
+    """UV coordinates (..., 2) -> pixel coordinates (..., 2) of a width x height bake
+    (V points up, pixel y down from the top)."""
+    return np.stack([uvs[..., 0] * width, (1 - uvs[..., 1]) * height], axis=-1)
+
+
+def _to_camera(view: View) -> np.ndarray:
+    """Unit vector from the scene towards `view`'s camera."""
+    return -view.basis()[2]
+
+
+def _facing(mesh: MeshData, view: View) -> np.ndarray:
+    """Per triangle: cosine between its normal and the direction to the camera
+    (> 0 = front-facing)."""
+    return mesh.normals @ _to_camera(view)
+
+
 def _rasterize(tris: np.ndarray, width: int, height: int) -> Iterator[tuple[int, np.ndarray, np.ndarray, np.ndarray]]:
     """For each triangle (T, 3, 2) in pixel coordinates, yield (index, ys, xs, barycentrics)
     of the pixel centers it covers. Degenerate triangles cover nothing."""
@@ -90,12 +107,11 @@ def project_view(mesh: MeshData, view: View, image: Image.Image, bake_size: int 
     pixels = np.asarray(image.convert("RGB").resize((view.resolution, view.resolution)), dtype=np.float64)
     zbuf = depth_buffer(mesh, view)
     pixel_world = view.ortho_scale / view.resolution
-    facing = mesh.normals @ -view.basis()[2]
+    facing = _facing(mesh, view)
 
     color = np.zeros((bake_size, bake_size, 3))
     weight = np.zeros((bake_size, bake_size))
-    uv_px = np.stack([mesh.uvs[..., 0] * bake_size, (1 - mesh.uvs[..., 1]) * bake_size], axis=-1)
-    for i, ys, xs, bary in _rasterize(uv_px, bake_size, bake_size):
+    for i, ys, xs, bary in _rasterize(_uv_to_pixels(mesh.uvs, bake_size, bake_size), bake_size, bake_size):
         if facing[i] < MIN_FACING:
             continue
         x, y, depth = view.project(bary @ mesh.positions[i])
@@ -111,7 +127,7 @@ def project_view(mesh: MeshData, view: View, image: Image.Image, bake_size: int 
             weight[ys, xs] = facing[i]
         else:
             normals = bary[visible] @ corner_normals[i]
-            cos = normals @ -view.basis()[2] / np.linalg.norm(normals, axis=1)
+            cos = normals @ _to_camera(view) / np.linalg.norm(normals, axis=1)
             weight[ys, xs] = np.maximum(cos, 1e-3)
     return ViewBake(color=color, weight=weight)
 
@@ -121,7 +137,7 @@ def _camera_raster(mesh: MeshData, view: View) -> tuple[np.ndarray, np.ndarray]:
     its barycentric coordinates there."""
     res = view.resolution
     x, y, depth = view.project(mesh.positions)
-    facing = mesh.normals @ -view.basis()[2]
+    facing = _facing(mesh, view)
     zbuf = np.full((res, res), np.inf)
     index = np.full((res, res), -1)
     bary_buf = np.zeros((res, res, 3))
@@ -149,7 +165,8 @@ def render_painted(mesh: MeshData, view: View, color: np.ndarray, weight: np.nda
     confidence = np.zeros((res, res))
     hit = index >= 0
     uv = np.einsum("nk,nkc->nc", bary[hit], mesh.uvs[index[hit]])
-    sampled = _sample_bilinear(painted, uv[:, 0] * w, (1 - uv[:, 1]) * h)
+    px = _uv_to_pixels(uv, w, h)
+    sampled = _sample_bilinear(painted, px[:, 0], px[:, 1])
     image[hit] = sampled[:, :3]
     confidence[hit] = sampled[:, 3]
     return image, confidence
@@ -158,8 +175,7 @@ def render_painted(mesh: MeshData, view: View, color: np.ndarray, weight: np.nda
 def surface_mask(mesh: MeshData, size: int = BAKE_SIZE) -> np.ndarray:
     """(size, size) bool: texels whose center lies inside a UV triangle."""
     mask = np.zeros((size, size), bool)
-    uv_px = np.stack([mesh.uvs[..., 0] * size, (1 - mesh.uvs[..., 1]) * size], axis=-1)
-    for _, ys, xs, _ in _rasterize(uv_px, size, size):
+    for _, ys, xs, _ in _rasterize(_uv_to_pixels(mesh.uvs, size, size), size, size):
         mask[ys, xs] = True
     return mask
 

@@ -14,10 +14,11 @@ MAX_COLORS = 256
 def reduce_to_psx(texture: Image.Image, size: int = TEXTURE_SIZE, colors: int = MAX_COLORS) -> Image.Image:
     """Downscale to `size` px and quantize to at most `colors` colors, no dithering.
 
-    The downscale is an area average (BOX), so a texel is the mean of the bake
-    texels it covers instead of an aliased point sample. "Nearest" in the PSX
-    contract is the sampling filter of the texture in the material, set when
-    it is packed into the .blend.
+    The downscale here is an area average (`Image.Resampling.BOX`), so a texel is
+    the mean of the bake texels it covers instead of an aliased point sample; it
+    is *not* a nearest-neighbour resize. "Nearest" in the PSX contract is how the
+    texture is *sampled* at render time: the material's Image Texture
+    interpolation, set to Closest when `pack` puts the texture into the .blend.
     """
     small = texture.convert("RGB").resize((size, size), Image.Resampling.BOX)
     quantized = small.quantize(colors=colors, method=Image.Quantize.MEDIANCUT, dither=Image.Dither.NONE)

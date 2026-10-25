@@ -7,13 +7,14 @@ ACC_WORK_DIR/comfyui so nothing lands in the repo or the install dir.
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 import time
 from pathlib import Path
 from urllib.parse import urlparse
 
 from make import settings
-from make.comfyui import http
+from make.comfyui import availability, http
 from make.comfyui.install import venv_python
 
 
@@ -29,7 +30,7 @@ def _pid_file() -> Path:
 
 def is_up(url: str) -> bool:
     try:
-        http.get_json(f"{url}/system_stats", timeout=2)
+        availability.probe(url, timeout=2)
         return True
     except (http.ServerUnreachable, http.HttpError):
         return False
@@ -57,12 +58,12 @@ def start(wait: float = 300) -> str:
         "--temp-directory", str(state),
     ]
     cmd += os.environ.get("COMFYUI_ARGS", "").split()
-    log = open(state / "server.log", "ab")
     flags = 0
     if os.name == "nt":
         flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
-    process = subprocess.Popen(cmd, cwd=root / "ComfyUI", stdout=log, stderr=subprocess.STDOUT,
-                               stdin=subprocess.DEVNULL, creationflags=flags)
+    with open(state / "server.log", "ab") as log:  # the child keeps its own handle
+        process = subprocess.Popen(cmd, cwd=root / "ComfyUI", stdout=log, stderr=subprocess.STDOUT,
+                                   stdin=subprocess.DEVNULL, creationflags=flags)
     _pid_file().write_text(str(process.pid))
     deadline = time.monotonic() + wait
     while time.monotonic() < deadline:
@@ -85,7 +86,7 @@ def stop() -> None:
         subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True)
     else:
         try:
-            os.kill(pid, 15)
+            os.kill(pid, signal.SIGTERM)
         except ProcessLookupError:
             pass
     pid_file.unlink()

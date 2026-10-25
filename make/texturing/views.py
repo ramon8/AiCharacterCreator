@@ -12,11 +12,17 @@ elevation raises the camera.
 from __future__ import annotations
 
 import math
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 
 import numpy as np
 
 from make.texturing.mesh import MeshData
+
+# What each named camera shows, for view-dependent prompting: telling the model
+# which side it paints keeps the back from getting a second face or chest emblem.
+SIDES = {"front": "front view", "right": "side view from the right", "left": "side view from the left",
+         "back": "back view, seen from behind", "top": "top view, seen from above"}
 
 
 @dataclass(frozen=True)
@@ -43,6 +49,19 @@ class View:
         radius = float(np.linalg.norm(hi - lo))
         return cls(name, tuple(float(c) for c in center), azimuth, elevation, float(extent * margin),
                    resolution, distance=max(10.0, 2 * radius))
+
+    @classmethod
+    def around(cls, mesh: MeshData, angles: Iterable[tuple[str, float, float]],
+               resolution: int = 1024) -> list["View"]:
+        """One framing view per (name, azimuth, elevation), in that order."""
+        return [cls.framing(mesh, name=name, azimuth=az, elevation=el, resolution=resolution)
+                for name, az, el in angles]
+
+    @property
+    def side(self) -> str | None:
+        """Prompt phrase naming the side of the character this view shows (None for
+        views without one, such as the in-between preview angles)."""
+        return SIDES.get(self.name)
 
     def basis(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """(right, up, forward) unit vectors; forward points from the camera into the scene."""

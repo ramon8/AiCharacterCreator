@@ -22,6 +22,15 @@ import json
 from pathlib import Path
 
 WORKFLOWS_DIR = Path(__file__).resolve().parent.parent / "workflows"
+# The two workflows apply IP-Adapter differently on purpose (#19):
+# - DEFAULT (a fresh view, from noise): weight type "linear", so the reference passes
+#   on its content and composition too. That is what we want for the first view (the
+#   front of a front-facing reference) and for the single-view texture.
+# - REPAINT (a view that continues earlier ones): weight type "style transfer" for both
+#   the reference and the first generated view, so they pass on palette, materials and
+#   drawing style but not composition. With "linear" every side and the back repeated
+#   the front's centred chest emblem; the content of a later view comes instead from the
+#   paint it continues (init + repaint mask) and its view-dependent prompt.
 DEFAULT_WORKFLOW = "view_sdxl_cn_ipadapter"
 REPAINT_WORKFLOW = "view_sdxl_cn_ipadapter_repaint"
 

@@ -28,4 +28,5 @@ def work_dir() -> Path:
 
 
 def comfyui_url() -> str:
+    """Base URL without a trailing slash: callers append `/<endpoint>` to it."""
     return os.environ.get("COMFYUI_URL", DEFAULT_COMFYUI_URL).rstrip("/")
