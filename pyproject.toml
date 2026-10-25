@@ -1,0 +1,24 @@
+[project]
+name = "make"
+version = "0.1.0"
+description = "PSX character pipeline: drives Blender and ComfyUI headless"
+requires-python = ">=3.12"
+dependencies = ["pillow>=10"]
+
+[project.scripts]
+make = "make.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["make"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["comfyui: needs a running ComfyUI server with the models installed (deselect with -m 'not comfyui')"]
+addopts = "-m 'not comfyui'"
