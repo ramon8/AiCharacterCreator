@@ -3,7 +3,10 @@ name = "make"
 version = "0.1.0"
 description = "PSX character pipeline: drives Blender and ComfyUI headless"
 requires-python = ">=3.12"
-dependencies = ["pillow>=10"]
+dependencies = [
+    "numpy>=2.5.4",
+    "pillow>=10",
+]
 
 [project.scripts]
 make = "make.cli:main"

@@ -42,6 +42,26 @@ def _generate(args: argparse.Namespace) -> int:
     return 0
 
 
+def _texture(args: argparse.Namespace) -> int:
+    from make import settings
+    from make.comfyui import availability
+    from make.generation import ComfyUIClient
+    from make.texturing.pipeline import texture_single_view
+    from make.texturing.testmesh import build_test_mesh
+
+    availability.check()
+    stem = args.mesh.stem if args.mesh else "test_mesh"
+    work = args.work_dir or settings.work_dir() / "texturing" / f"{stem}_seed{args.seed}"
+    mesh = args.mesh or build_test_mesh(work / "test_mesh.blend")
+    out = args.out or work / f"{stem}_textured.blend"
+    result = texture_single_view(mesh_blend=mesh, reference=args.reference, prompt=args.prompt,
+                                 seed=args.seed, out_blend=out, client=ComfyUIClient(), work_dir=work)
+    for step, seconds in result.timings.items():
+        print(f"  {step:<18} {seconds:6.2f}s")
+    print(f"blend:   {result.blend}\npreview: {result.preview}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="make")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -59,6 +79,15 @@ def main(argv: list[str] | None = None) -> int:
     gen.add_argument("--seed", type=int, default=0)
     gen.add_argument("--out", type=Path, required=True)
     gen.set_defaults(func=_generate)
+
+    tex = sub.add_parser("texture", help="texture a mesh from one front view (spike #18)")
+    tex.add_argument("--mesh", type=Path, help=".blend with one UV-mapped mesh (default: generated test mesh)")
+    tex.add_argument("--reference", type=Path, required=True)
+    tex.add_argument("--prompt", required=True)
+    tex.add_argument("--seed", type=int, default=0)
+    tex.add_argument("--out", type=Path, help="output .blend (default: in the work dir)")
+    tex.add_argument("--work-dir", type=Path, help="intermediates (default: ACC_WORK_DIR/texturing/<mesh>_seed<n>)")
+    tex.set_defaults(func=_texture)
 
     args = parser.parse_args(argv)
     return args.func(args)

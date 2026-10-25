@@ -12,6 +12,11 @@ from pathlib import Path
 DEFAULT_COMFYUI_DIR = Path(r"C:\Develop\ComfyUI")
 DEFAULT_WORK_DIR = Path(r"C:\Develop\AiCharacterCreator-work")
 DEFAULT_COMFYUI_URL = "http://127.0.0.1:8188"
+DEFAULT_BLENDER_EXE = Path(r"C:\Program Files\Blender Foundation\Blender 5.0\blender.exe")
+
+
+def blender_exe() -> Path:
+    return Path(os.environ.get("BLENDER_EXE", DEFAULT_BLENDER_EXE))
 
 
 def comfyui_dir() -> Path:
