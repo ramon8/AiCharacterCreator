@@ -102,8 +102,13 @@ class FakeComfyUI:
             }
             return {"prompt_id": pid, "number": len(self.prompts)}, 200
         save_id = next(k for k, n in graph.items() if n["class_type"] == "SaveImage")
-        latent = next(n for n in graph.values() if n["class_type"] == "EmptyLatentImage")["inputs"]
-        image = Image.new("RGB", (latent["width"], latent["height"]), self.output_color)
+        latent = next((n for n in graph.values() if n["class_type"] == "EmptyLatentImage"), None)
+        if latent is not None:
+            size = (latent["inputs"]["width"], latent["inputs"]["height"])
+        else:  # repaint workflows start from the init image
+            init = next(n for n in graph.values() if n["_meta"]["title"] == "input:init")["inputs"]["image"]
+            size = Image.open(io.BytesIO(self.uploads[init])).size
+        image = Image.new("RGB", size, self.output_color)
         buffer = io.BytesIO()
         image.save(buffer, "PNG")
         filename = f"{pid}.png"

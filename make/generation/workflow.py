@@ -8,7 +8,9 @@ pipeline finds the nodes it fills in by their `_meta.title`:
     input:depth         LoadImage.image
     input:normal        LoadImage.image
     input:reference:N   LoadImage.image (N = 0, 1, ...)
-    input:size          EmptyLatentImage.width/height
+    input:size          EmptyLatentImage.width/height (when the workflow starts from noise)
+    input:init          LoadImage.image: what earlier views painted (repaint workflows)
+    input:repaint       LoadImage.image: repaint mask, white = generate (repaint workflows)
     input:seed          KSampler.seed
     output:image        SaveImage
 """
@@ -21,6 +23,7 @@ from pathlib import Path
 
 WORKFLOWS_DIR = Path(__file__).resolve().parent.parent / "workflows"
 DEFAULT_WORKFLOW = "view_sdxl_cn_ipadapter"
+REPAINT_WORKFLOW = "view_sdxl_cn_ipadapter_repaint"
 
 
 class Workflow:
@@ -35,6 +38,14 @@ class Workflow:
     @classmethod
     def load_default(cls) -> "Workflow":
         return cls.load(DEFAULT_WORKFLOW)
+
+    @classmethod
+    def load_repaint(cls) -> "Workflow":
+        return cls.load(REPAINT_WORKFLOW)
+
+    @classmethod
+    def load_all(cls) -> list["Workflow"]:
+        return [cls.load(p.stem) for p in sorted(WORKFLOWS_DIR.glob("*.json"))]
 
     def node_types(self) -> set[str]:
         return {node["class_type"] for node in self.graph.values()}

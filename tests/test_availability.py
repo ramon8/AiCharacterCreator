@@ -29,3 +29,9 @@ def test_names_the_custom_node_that_provides_a_missing_node_type(comfy):
     assert "missing node type IPAdapterAdvanced (custom node ComfyUI_IPAdapter_plus not installed)" in message
     assert "missing node type IPAdapterModelLoader" in message
     assert "missing model" not in message
+
+
+def test_checks_the_nodes_of_the_repaint_workflow_too(comfy):
+    comfy.node_types.discard("DifferentialDiffusion")
+    with pytest.raises(ComfyUIUnavailable, match="missing node type DifferentialDiffusion"):
+        check(comfy.url)

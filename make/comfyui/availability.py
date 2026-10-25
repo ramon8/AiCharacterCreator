@@ -13,9 +13,11 @@ class ComfyUIUnavailable(Exception):
     pass
 
 
-def check(url: str | None = None, workflow: Workflow | None = None) -> None:
+def check(url: str | None = None, workflows: list[Workflow] | None = None) -> None:
+    """Raise `ComfyUIUnavailable` unless the server can run `workflows` (default: all
+    the workflows in the repo)."""
     url = (url or settings.comfyui_url()).rstrip("/")
-    workflow = workflow or Workflow.load_default()
+    workflows = workflows or Workflow.load_all()
     try:
         http.get_json(f"{url}/system_stats", timeout=5)
     except (http.ServerUnreachable, http.HttpError) as error:
@@ -25,7 +27,7 @@ def check(url: str | None = None, workflow: Workflow | None = None) -> None:
 
     problems: list[str] = []
     provided_by = {t: node.name for node in manifest.CUSTOM_NODES for t in node.node_types}
-    for node_type in sorted(workflow.node_types()):
+    for node_type in sorted(set().union(*(w.node_types() for w in workflows))):
         if not http.get_json(f"{url}/object_info/{quote(node_type)}"):
             source = provided_by.get(node_type)
             hint = f" (custom node {source} not installed)" if source else ""
@@ -43,7 +45,7 @@ def check(url: str | None = None, workflow: Workflow | None = None) -> None:
 
     if problems:
         raise ComfyUIUnavailable(
-            f"ComfyUI at {url} cannot run workflow {workflow.name!r}:\n  - "
+            f"ComfyUI at {url} cannot run workflow(s) {', '.join(w.name for w in workflows)}:\n  - "
             + "\n  - ".join(problems)
             + "\nRun `uv run make comfyui install` to fix."
         )

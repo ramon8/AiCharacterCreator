@@ -169,10 +169,18 @@ def export_mesh(params: dict) -> dict:
 
 def render_view(params: dict) -> dict:
     """Depth (near = white), normal (camera space, (n+1)/2, +Z toward the camera) and mask
-    renders of the mesh from one orthographic view. Raw view transform: pixel = shader value."""
+    renders of the mesh from one orthographic view. Raw view transform: pixel = shader value.
+
+    With `smooth_angle` (degrees) the normal pass is smooth-shaded across edges flatter
+    than that angle (in memory only), so a low-poly head conditions the generation as a
+    round head instead of a faceted ball; sharper edges stay sharp."""
     view = params["view"]
     out = Path(params["out_dir"])
     out.mkdir(parents=True, exist_ok=True)
+    if params.get("smooth_angle") is not None:
+        mesh = the_mesh().data
+        mesh.shade_smooth()
+        mesh.set_sharp_from_angle(angle=math.radians(params["smooth_angle"]))
     setup_render(view["resolution"], "Raw")
     place_camera(view)
 

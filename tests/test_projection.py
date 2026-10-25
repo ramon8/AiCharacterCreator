@@ -4,7 +4,7 @@ import numpy as np
 from PIL import Image
 
 from make.texturing.mesh import MeshData
-from make.texturing.projection import project_view
+from make.texturing.projection import ViewBake, merge_views, project_view, render_painted, surface_mask, to_texture
 from make.texturing.views import View
 
 RED, BLUE, GREEN, YELLOW = (255, 0, 0), (0, 0, 255), (0, 255, 0), (255, 255, 0)
@@ -79,3 +79,87 @@ def test_oblique_faces_weigh_less_than_frontal_ones():
     tilted = MeshData(positions=corners[tris], uvs=uv[tris], normals=np.array([normal, normal]))
     bake = project_view(tilted, FRONT, quadrants(), bake_size=64)
     assert abs(bake.weight[texel(bake, 0.5, 0.5)[::-1]] - 0.5) < 1e-6
+
+
+def test_what_earlier_views_painted_renders_back_from_their_camera():
+    surface = mesh(quad(0.0))
+    bake = project_view(surface, FRONT, quadrants(), bake_size=128)
+    image, confidence = render_painted(surface, FRONT, bake.color, bake.weight)
+    assert image.shape == (256, 256, 3) and confidence.shape == (256, 256)
+    assert tuple(np.round(image[64, 64]).astype(int)) == RED
+    assert tuple(np.round(image[64, 192]).astype(int)) == BLUE
+    assert tuple(np.round(image[192, 64]).astype(int)) == GREEN
+    assert tuple(np.round(image[192, 192]).astype(int)) == YELLOW
+    assert confidence[128, 128] > 0.99
+
+
+def test_parts_no_earlier_view_painted_have_no_confidence():
+    surface = mesh(quad(0.0, x0=-0.5, x1=0.5))  # half the frame wide: the rest is background
+    weight = np.zeros((64, 64))
+    weight[:, :32] = 1.0  # only the left half of the UV (= left of the quad) is painted
+    image, confidence = render_painted(surface, FRONT, np.full((64, 64, 3), 200.0), weight)
+    assert confidence[128, 100] == 1.0  # left part of the quad
+    assert confidence[128, 156] == 0.0  # right part, unpainted
+    assert confidence[128, 10] == 0.0  # background
+
+
+def test_sharper_blending_favours_the_view_that_faces_the_surface_most():
+    def bake(color, w):
+        return ViewBake(color=np.full((1, 1, 3), color, float), weight=np.full((1, 1), w))
+
+    front, side = bake((100, 0, 0), 0.8), bake((0, 0, 0), 0.4)
+    linear, _ = merge_views([front, side])
+    sharp, _ = merge_views([front, side], sharpness=2)
+    assert round(linear[0, 0, 0], 3) == 66.667
+    assert round(sharp[0, 0, 0], 3) == 80.0
+
+
+def test_surface_mask_is_where_the_uv_layout_has_triangles():
+    half = quad(0.0, uv=((0, 0), (0.5, 0), (0.5, 1), (0, 1)))
+    surface = surface_mask(mesh(half), 64)
+    assert surface[:, :31].all() and not surface[:, 33:].any()
+
+
+def test_surface_nobody_painted_is_filled_from_its_painted_neighbours_not_grey():
+    color = np.zeros((64, 64, 3))
+    color[:, :4] = (10, 200, 30)
+    covered = np.zeros((64, 64), bool)
+    covered[:, :4] = True
+    surface = np.zeros((64, 64), bool)
+    surface[:, :40] = True  # painted strip + 36 px of unpainted surface, beyond the padding
+    texture = np.asarray(to_texture(color, covered, padding=2, surface=surface))
+    assert tuple(texture[32, 39]) == (10, 200, 30)
+    assert tuple(texture[32, 60]) == (128, 128, 128)  # off the surface, past the padding
+
+
+def ridge():
+    """Two quads meeting at a vertical ridge on X = 0 that points at the front camera,
+    each turned 30 degrees away from it; UV: left quad u 0..0.5, right quad u 0.5..1."""
+    a = np.radians(30)
+    def side(sign):
+        outer = np.array([sign * np.cos(a), np.sin(a), 0.0])
+        normal = np.array([sign * np.sin(a), -np.cos(a), 0.0])
+        corners = np.array([(0, 0, -1), outer - (0, 0, 1), outer + (0, 0, 1), (0, 0, 1)], float)
+        if sign < 0:
+            corners = corners[[1, 0, 3, 2]]
+        u0 = 0.0 if sign < 0 else 0.5
+        uv = np.array([(u0, 0), (u0 + 0.5, 0), (u0 + 0.5, 1), (u0, 1)], float)
+        tris = [(0, 1, 2), (0, 2, 3)]
+        return corners[tris], uv[tris], np.array([normal, normal])
+    return mesh(side(-1), side(1))
+
+
+def test_flat_weights_are_constant_across_a_face():
+    bake = project_view(ridge(), FRONT, quadrants(), bake_size=64)
+    near_ridge, near_outer = bake.weight[32, 30], bake.weight[32, 2]
+    assert abs(near_ridge - np.cos(np.radians(30))) < 1e-6
+    assert abs(near_outer - np.cos(np.radians(30))) < 1e-6
+
+
+def test_smooth_weights_vary_across_the_face_so_views_hand_over_gradually():
+    bake = project_view(ridge(), FRONT, quadrants(), bake_size=64, smooth_angle=70)
+    near_ridge, near_outer = bake.weight[32, 31], bake.weight[32, 1]
+    assert near_ridge > 0.99  # the welded normal on the ridge faces the camera
+    assert abs(near_outer - np.cos(np.radians(30))) < 0.02
+    sharp = project_view(ridge(), FRONT, quadrants(), bake_size=64, smooth_angle=45)
+    assert abs(sharp.weight[32, 31] - np.cos(np.radians(30))) < 1e-6  # normals 60 degrees apart: a sharp edge

@@ -84,3 +84,40 @@ def test_reports_a_failure_while_executing(comfy, tmp_path):
     comfy.execution_error = "CUDA out of memory"
     with pytest.raises(GenerationError, match="CUDA out of memory"):
         ComfyUIClient(comfy.url, work_dir=tmp_path).generate(conditions())
+
+
+def repaint_conditions(**overrides):
+    values = dict(
+        references=(solid((255, 0, 0), (300, 300)), solid((0, 0, 255), (300, 300))),
+        init=solid((20, 40, 60)),
+        repaint=Image.new("L", (512, 384), 255),
+    )
+    values.update(overrides)
+    return conditions(**values)
+
+
+def test_continuing_a_view_sends_the_painted_image_the_repaint_mask_and_both_references(comfy, tmp_path):
+    references = (solid((1, 1, 1), (300, 300)), solid((2, 2, 2), (300, 300)))
+    init, repaint = solid((3, 3, 3)), Image.new("L", (512, 384), 0)
+    repaint.paste(255, (0, 0, 256, 384))
+    image = ComfyUIClient(comfy.url, work_dir=tmp_path).generate(
+        repaint_conditions(references=references, init=init, repaint=repaint)
+    )
+    [graph] = comfy.prompts
+    expected = [("input:reference:0", references[0]), ("input:reference:1", references[1]),
+                ("input:init", init), ("input:repaint", repaint.convert("RGB"))]
+    for title, sent_image in expected:
+        sent = uploaded(comfy, node_titled(graph, title)["image"])
+        assert ImageChops.difference(sent, sent_image).getbbox() is None, title
+    assert image.size == (512, 384)
+
+
+def test_a_fresh_view_uses_the_single_reference_workflow(comfy, tmp_path):
+    ComfyUIClient(comfy.url, work_dir=tmp_path).generate(conditions())
+    [graph] = comfy.prompts
+    assert not any(n["_meta"]["title"] == "input:init" for n in graph.values())
+
+
+def test_continuing_a_view_needs_the_painted_image_and_the_repaint_mask_together(comfy, tmp_path):
+    with pytest.raises(ValueError, match="init and repaint"):
+        ComfyUIClient(comfy.url, work_dir=tmp_path).generate(repaint_conditions(repaint=None))

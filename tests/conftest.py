@@ -8,7 +8,7 @@ from fake_comfyui import FakeComfyUI
 
 def complete_install() -> tuple[set[str], dict[str, list[str]]]:
     """Node types and model listings of a ComfyUI with everything installed."""
-    nodes = Workflow.load_default().node_types()
+    nodes = set().union(*(w.node_types() for w in Workflow.load_all()))
     models: dict[str, list[str]] = {}
     for model in manifest.MODELS:
         models.setdefault(model.folder, []).append(model.filename)

@@ -78,8 +78,15 @@ def _sample_bilinear(image: np.ndarray, x: np.ndarray, y: np.ndarray) -> np.ndar
     return top * (1 - fy) + bottom * fy
 
 
-def project_view(mesh: MeshData, view: View, image: Image.Image, bake_size: int = BAKE_SIZE) -> ViewBake:
-    """Project `image`, seen from `view`, onto the mesh UV at `bake_size` px."""
+def project_view(mesh: MeshData, view: View, image: Image.Image, bake_size: int = BAKE_SIZE,
+                 smooth_angle: float | None = None) -> ViewBake:
+    """Project `image`, seen from `view`, onto the mesh UV at `bake_size` px.
+
+    The weight is the facing cosine of the face; with `smooth_angle` (degrees) it uses
+    normals interpolated across edges flatter than that instead, so on curved parts the
+    weight (and the hand-over between views) changes gradually inside each face rather
+    than jumping at its edges. Visibility is still decided per face."""
+    corner_normals = mesh.corner_normals(smooth_angle) if smooth_angle is not None else None
     pixels = np.asarray(image.convert("RGB").resize((view.resolution, view.resolution)), dtype=np.float64)
     zbuf = depth_buffer(mesh, view)
     pixel_world = view.ortho_scale / view.resolution
@@ -100,41 +107,118 @@ def project_view(mesh: MeshData, view: View, image: Image.Image, bake_size: int 
         visible &= (x >= 0) & (x < view.resolution) & (y >= 0) & (y < view.resolution)
         ys, xs = ys[visible], xs[visible]
         color[ys, xs] = _sample_bilinear(pixels, x[visible], y[visible])
-        weight[ys, xs] = facing[i]
+        if corner_normals is None:
+            weight[ys, xs] = facing[i]
+        else:
+            normals = bary[visible] @ corner_normals[i]
+            cos = normals @ -view.basis()[2] / np.linalg.norm(normals, axis=1)
+            weight[ys, xs] = np.maximum(cos, 1e-3)
     return ViewBake(color=color, weight=weight)
 
 
-def merge_views(bakes: Sequence[ViewBake]) -> tuple[np.ndarray, np.ndarray]:
-    """Weighted blend of several view bakes -> (color, coverage mask)."""
-    total = sum(b.weight for b in bakes)
-    color = sum(b.color * b.weight[..., None] for b in bakes)
+def _camera_raster(mesh: MeshData, view: View) -> tuple[np.ndarray, np.ndarray]:
+    """Per camera pixel: index of the nearest front-facing triangle (-1 = none) and
+    its barycentric coordinates there."""
+    res = view.resolution
+    x, y, depth = view.project(mesh.positions)
+    facing = mesh.normals @ -view.basis()[2]
+    zbuf = np.full((res, res), np.inf)
+    index = np.full((res, res), -1)
+    bary_buf = np.zeros((res, res, 3))
+    for i, ys, xs, bary in _rasterize(np.stack([x, y], axis=-1), res, res):
+        if facing[i] <= 0:
+            continue
+        d = bary @ depth[i]
+        nearer = d < zbuf[ys, xs]
+        ys, xs = ys[nearer], xs[nearer]
+        zbuf[ys, xs], index[ys, xs], bary_buf[ys, xs] = d[nearer], i, bary[nearer]
+    return index, bary_buf
+
+
+def render_painted(mesh: MeshData, view: View, color: np.ndarray, weight: np.ndarray,
+                   bleed: int = 2) -> tuple[np.ndarray, np.ndarray]:
+    """What a UV bake (color + weight) looks like from `view`: (res, res, 3) color and
+    (res, res) confidence = the bake weight at the surface point each pixel sees,
+    0 on the background and where nothing was painted. The bake is bled `bleed`
+    texels first so UV seams don't sample the empty gutter."""
+    painted, _ = _bleed(np.concatenate([color, weight[..., None]], axis=-1), weight > 0, bleed)
+    h, w = weight.shape
+    index, bary = _camera_raster(mesh, view)
+    res = view.resolution
+    image = np.zeros((res, res, 3))
+    confidence = np.zeros((res, res))
+    hit = index >= 0
+    uv = np.einsum("nk,nkc->nc", bary[hit], mesh.uvs[index[hit]])
+    sampled = _sample_bilinear(painted, uv[:, 0] * w, (1 - uv[:, 1]) * h)
+    image[hit] = sampled[:, :3]
+    confidence[hit] = sampled[:, 3]
+    return image, confidence
+
+
+def surface_mask(mesh: MeshData, size: int = BAKE_SIZE) -> np.ndarray:
+    """(size, size) bool: texels whose center lies inside a UV triangle."""
+    mask = np.zeros((size, size), bool)
+    uv_px = np.stack([mesh.uvs[..., 0] * size, (1 - mesh.uvs[..., 1]) * size], axis=-1)
+    for _, ys, xs, _ in _rasterize(uv_px, size, size):
+        mask[ys, xs] = True
+    return mask
+
+
+def merge_views(bakes: Sequence[ViewBake], sharpness: float = 1.0) -> tuple[np.ndarray, np.ndarray]:
+    """Blend several view bakes -> (color, coverage mask). Each view weighs its facing
+    cosine to the power `sharpness`: higher values let the view that faces a texel
+    most dominate (less ghosting where views disagree), 1 is a plain weighted mean."""
+    weights = [b.weight ** sharpness for b in bakes]
+    total = sum(weights)
+    color = sum(b.color * w[..., None] for b, w in zip(bakes, weights))
     covered = total > 0
     color[covered] /= total[covered][:, None]
     return color, covered
 
 
-def to_texture(color: np.ndarray, covered: np.ndarray, padding: int = 8,
-               fill: tuple[int, int, int] = (128, 128, 128)) -> Image.Image:
-    """Bleed painted texels `padding` px into their surroundings (so UV island borders
-    don't pick up the fill once downscaled), then paint what is left with `fill`."""
-    color, covered = color.copy(), covered.copy()
+_NEIGHBOURS = ((-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1))
+
+
+def _bleed_step(values: np.ndarray, covered: np.ndarray) -> bool:
+    """Grow `covered` by one texel in place, averaging the covered neighbours. False
+    when nothing could grow."""
     h, w = covered.shape
-    for _ in range(padding):
-        acc = np.zeros_like(color)
-        count = np.zeros((h, w))
-        for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1)):
-            src = np.zeros((h, w), bool)
-            shifted = np.zeros_like(color)
-            ys = slice(max(dy, 0), h + min(dy, 0)), slice(max(-dy, 0), h + min(-dy, 0))
-            xs = slice(max(dx, 0), w + min(dx, 0)), slice(max(-dx, 0), w + min(-dx, 0))
-            src[ys[1], xs[1]] = covered[ys[0], xs[0]]
-            shifted[ys[1], xs[1]] = color[ys[0], xs[0]]
-            acc += shifted * src[..., None]
-            count += src
-        grow = ~covered & (count > 0)
-        if not grow.any():
+    acc = np.zeros_like(values)
+    count = np.zeros((h, w))
+    for dy, dx in _NEIGHBOURS:
+        src = np.zeros((h, w), bool)
+        shifted = np.zeros_like(values)
+        ys = slice(max(dy, 0), h + min(dy, 0)), slice(max(-dy, 0), h + min(-dy, 0))
+        xs = slice(max(dx, 0), w + min(dx, 0)), slice(max(-dx, 0), w + min(-dx, 0))
+        src[ys[1], xs[1]] = covered[ys[0], xs[0]]
+        shifted[ys[1], xs[1]] = values[ys[0], xs[0]]
+        acc += shifted * src[..., None]
+        count += src
+    grow = ~covered & (count > 0)
+    if not grow.any():
+        return False
+    values[grow] = acc[grow] / count[grow][:, None]
+    covered |= grow
+    return True
+
+
+def _bleed(values: np.ndarray, covered: np.ndarray, steps: int) -> tuple[np.ndarray, np.ndarray]:
+    values, covered = values.copy(), covered.copy()
+    for _ in range(steps):
+        if not _bleed_step(values, covered):
             break
-        color[grow] = acc[grow] / count[grow][:, None]
-        covered |= grow
+    return values, covered
+
+
+def to_texture(color: np.ndarray, covered: np.ndarray, padding: int = 8,
+               fill: tuple[int, int, int] = (128, 128, 128), surface: np.ndarray | None = None) -> Image.Image:
+    """Bleed painted texels `padding` px into their surroundings (so UV island borders
+    don't pick up the fill once downscaled), then paint what is left with `fill`.
+    With a `surface` mask, bleeding goes on until no surface texel is left unpainted
+    (bits of the mesh no camera saw get the color of the painted surface around them)."""
+    color, covered = _bleed(color, covered, padding)
+    if surface is not None:
+        while (surface & ~covered).any() and _bleed_step(color, covered):
+            pass
     color[~covered] = fill
     return Image.fromarray(np.clip(np.round(color), 0, 255).astype(np.uint8))

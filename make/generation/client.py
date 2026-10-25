@@ -32,6 +32,10 @@ class Conditions:
         has their size (must be a multiple of 8, ~1024 px is SDXL's sweet spot).
     references: reference images for IP-Adapter, one per workflow slot.
     mask: optional; white = object. The output gets it as alpha channel.
+    init/repaint: optional, together. Continue a view that earlier views already
+        painted in part: `init` is that paint seen from this camera, `repaint` (L,
+        white = generate, black = keep, grey = change partly) says what to redo.
+        The client then uses its repaint workflow.
     """
 
     depth: Image.Image
@@ -40,6 +44,8 @@ class Conditions:
     seed: int
     references: tuple[Image.Image, ...] = ()
     mask: Image.Image | None = None
+    init: Image.Image | None = None
+    repaint: Image.Image | None = None
     negative_prompt: str = "blurry, lowres, text, watermark, signature, jpeg artifacts"
 
     @classmethod
@@ -91,9 +97,11 @@ class FakeGenerationClient:
 
 class ComfyUIClient:
     def __init__(self, url: str | None = None, workflow: Workflow | None = None,
-                 work_dir: Path | None = None, timeout: float = 600, poll_interval: float = 0.25):
+                 work_dir: Path | None = None, timeout: float = 600, poll_interval: float = 0.25,
+                 repaint_workflow: Workflow | None = None):
         self.url = (url or settings.comfyui_url()).rstrip("/")
         self.workflow = workflow or Workflow.load_default()
+        self.repaint_workflow = repaint_workflow or Workflow.load_repaint()
         self.work_dir = Path(work_dir or settings.work_dir()) / "generations"
         self.timeout = timeout
         self.poll_interval = poll_interval
@@ -104,10 +112,13 @@ class ComfyUIClient:
             raise ValueError(f"render size {width}x{height} must be a multiple of 8")
         if conditions.normal.size != conditions.depth.size:
             raise ValueError("depth and normal renders must have the same size")
-        slots = self.workflow.reference_slots()
+        if (conditions.init is None) != (conditions.repaint is None):
+            raise ValueError("init and repaint go together: give both to continue a view, or neither")
+        workflow = self.workflow if conditions.init is None else self.repaint_workflow
+        slots = workflow.reference_slots()
         if len(conditions.references) != slots:
             raise ValueError(
-                f"workflow {self.workflow.name!r} takes {slots} reference image(s), got {len(conditions.references)}"
+                f"workflow {workflow.name!r} takes {slots} reference image(s), got {len(conditions.references)}"
             )
 
         values: dict[str, dict] = {
@@ -115,16 +126,21 @@ class ComfyUIClient:
             "input:negative": {"text": conditions.negative_prompt},
             "input:depth": {"image": self._upload(conditions.depth.convert("RGB"))},
             "input:normal": {"image": self._upload(conditions.normal.convert("RGB"))},
-            "input:size": {"width": width, "height": height},
             "input:seed": {"seed": conditions.seed},
         }
+        if workflow.has("input:size"):
+            values["input:size"] = {"width": width, "height": height}
         for index, reference in enumerate(conditions.references):
             values[f"input:reference:{index}"] = {"image": self._upload(reference.convert("RGB"))}
-        graph = self.workflow.bind(values)
+        if conditions.init is not None:
+            values["input:init"] = {"image": self._upload(conditions.init.convert("RGB").resize((width, height)))}
+            repaint = conditions.repaint.convert("L").resize((width, height)).convert("RGB")
+            values["input:repaint"] = {"image": self._upload(repaint)}
+        graph = workflow.bind(values)
 
-        image = self._run(graph)
+        image = self._run(workflow, graph)
         image = _apply_mask(image, conditions.mask)
-        self._save(graph, image)
+        self._save(workflow, graph, image)
         return image
 
     def free(self, unload_models: bool = False) -> None:
@@ -142,11 +158,11 @@ class ComfyUIClient:
                                   {"overwrite": "true", "type": "input"})
         return response["name"]
 
-    def _run(self, graph: dict) -> Image.Image:
+    def _run(self, workflow: Workflow, graph: dict) -> Image.Image:
         try:
             queued = http.post_json(f"{self.url}/prompt", {"prompt": graph, "client_id": uuid.uuid4().hex})
         except http.HttpError as error:
-            raise GenerationError(f"ComfyUI rejected workflow {self.workflow.name!r}: {error.body}") from error
+            raise GenerationError(f"ComfyUI rejected workflow {workflow.name!r}: {error.body}") from error
         prompt_id = queued["prompt_id"]
 
         deadline = time.monotonic() + self.timeout
@@ -162,14 +178,14 @@ class ComfyUIClient:
         status = entry.get("status", {})
         if status.get("status_str") == "error":
             raise GenerationError(f"ComfyUI failed prompt {prompt_id}: {json.dumps(status.get('messages'))}")
-        images = entry["outputs"][self.workflow.node_id("output:image")]["images"]
+        images = entry["outputs"][workflow.node_id("output:image")]["images"]
         ref = images[0]
         query = urlencode({"filename": ref["filename"], "subfolder": ref["subfolder"], "type": ref["type"]})
         data = http.get_bytes(f"{self.url}/view?{query}")
         return Image.open(io.BytesIO(data)).convert("RGB")
 
-    def _save(self, graph: dict, image: Image.Image) -> None:
+    def _save(self, workflow: Workflow, graph: dict, image: Image.Image) -> None:
         self.work_dir.mkdir(parents=True, exist_ok=True)
-        stem = f"{time.strftime('%Y%m%d-%H%M%S')}_{self.workflow.name}_{uuid.uuid4().hex[:6]}"
+        stem = f"{time.strftime('%Y%m%d-%H%M%S')}_{workflow.name}_{uuid.uuid4().hex[:6]}"
         image.save(self.work_dir / f"{stem}.png")
         (self.work_dir / f"{stem}.json").write_text(json.dumps(graph, indent=1), encoding="utf-8")
